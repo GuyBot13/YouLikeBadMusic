@@ -15,7 +15,7 @@ faiss_index_file: "data/faiss.index"
 # directory by default when no --music-dir option is provided.  You can
 # override it on the command line.  This field is deliberately blank to
 # avoid committing a personal path to version control.
-music_dir: '/path/to/your/music/library'
+music_dir: '~/Documents/University/u26/csci4150/FinalProject/YouLikeBadMusic/tests/normaluser/mix1'
 
 sequencing:
   # Every N tracks, switch into contrast mode (negative style weight) to encourage

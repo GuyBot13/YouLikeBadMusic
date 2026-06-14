@@ -1,25 +1,40 @@
-# Personal path
-config.yaml
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Virtual environments
 .venv/
+venv/
+env/
+.conda/
 .env/
 
-# Data artefacts (fingerprints, embeddings, indices, features)
-data/
+# Local config
+config.yaml
 
-# Local settings
-# Do not ignore config.yaml; it is part of the repository.  Leave the
-# 'music_dir' field blank in the committed file and set it locally after cloning.
+# Generated recommender data
+data/*
+!data/README.md
+!data/.gitkeep
 
-# Notebook checkpoints
-*.ipynb_checkpoints
+# Generated web output
+web/static/playlist.m3u8
 
-# OS files
+# OS/editor
 .DS_Store
-Thumbs.dbconfig.yaml
+Thumbs.db
+.vscode/
+.idea/
 
+# Large installers / archives
+Miniconda3-latest-Linux-x86_64.sh
+*.zip
+*.tar.gz
+*.whl
+
+# Logs
+*.log
