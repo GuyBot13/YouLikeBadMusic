@@ -4,6 +4,8 @@ import argparse
 import json
 import re
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import faiss
 import numpy as np
@@ -15,6 +17,84 @@ from scripts.embed_clap import (
     read_mono,
 )
 
+EXPLANATION_ANGLES = [
+    (
+        "Focus primarily on how the candidate's likely genre or style "
+        "relates to the playlist."
+    ),
+    (
+        "Focus primarily on mood and emotional character."
+    ),
+    (
+        "Focus primarily on tone, texture, and overall sonic character."
+    ),
+    (
+        "Focus on how the candidate complements the playlist while "
+        "still introducing some variety."
+    ),
+    (
+        "Focus on the strongest connection to the nearest seed songs."
+    ),
+    (
+        "Give a balanced explanation using style, mood, and tone."
+    ),
+]
+
+GENRE_LABELS = [
+    "hip-hop",
+    "rap",
+    "rock",
+    "indie rock",
+    "alternative rock",
+    "punk",
+    "metal",
+    "jazz",
+    "classical",
+    "orchestral",
+    "electronic",
+    "ambient",
+    "vaporwave",
+    "funk",
+    "soul",
+    "R&B",
+    "pop",
+    "folk",
+    "experimental",
+]
+
+MOOD_LABELS = [
+    "energetic",
+    "calm",
+    "melancholic",
+    "uplifting",
+    "dark",
+    "dreamy",
+    "tense",
+    "playful",
+    "reflective",
+    "aggressive",
+    "mysterious",
+    "nostalgic",
+    "triumphant",
+    "somber",
+]
+
+TONE_LABELS = [
+    "warm",
+    "bright",
+    "dark",
+    "raw",
+    "polished",
+    "spacious",
+    "intimate",
+    "atmospheric",
+    "dense",
+    "minimal",
+    "rhythmic",
+    "smooth",
+    "abrasive",
+    "cinematic",
+]
 
 def load_config(path: str | Path) -> dict:
     with Path(path).open("r", encoding="utf-8") as file:
@@ -120,11 +200,14 @@ def find_seed_tracks(
     return tracks
 
 
-def embed_seed_tracks(seed_tracks: list[Path]) -> np.ndarray:
+def embed_seed_tracks(
+    seed_tracks: list[Path],
+) -> tuple[np.ndarray, list[Path]]:
     print("Loading CLAP model...")
     model = _load_clap()
 
     embeddings: list[np.ndarray] = []
+    successful_tracks: list[Path] = []
     failed: list[tuple[Path, str]] = []
 
     for number, path in enumerate(seed_tracks, start=1):
@@ -146,6 +229,7 @@ def embed_seed_tracks(seed_tracks: list[Path]) -> np.ndarray:
             ).astype(np.float32)
 
             embeddings.append(embedding)
+            successful_tracks.append(path)
 
         except Exception as error:
             failed.append((path, str(error)))
@@ -155,12 +239,392 @@ def embed_seed_tracks(seed_tracks: list[Path]) -> np.ndarray:
         print(f"\nFailed to embed {len(failed)} seed files.")
 
     if not embeddings:
+        raise RuntimeError("No seed files could be embedded.")
+
+    return (
+        normalize_rows(np.vstack(embeddings)),
+        successful_tracks,
+        model,
+    )
+
+def call_ollama(
+    prompt: str,
+    config: dict,
+) -> str:
+    """
+    Send a prompt to the local Ollama API.
+
+    Raises RuntimeError when Ollama is unreachable, the model is missing,
+    or Ollama returns an invalid response.
+    """
+    llm_config = config.get("llm", {})
+
+    model = llm_config.get("model")
+
+    if not model:
         raise RuntimeError(
-            "No seed files could be embedded."
+            "No Ollama model configured under llm.model."
         )
 
-    return normalize_rows(np.vstack(embeddings))
+    base_url = str(
+        llm_config.get(
+            "base_url",
+            "http://127.0.0.1:11434",
+        )
+    ).rstrip("/")
 
+    url = f"{base_url}/api/generate"
+
+    max_tokens = int(
+        llm_config.get("max_tokens", 120)
+    )
+    temperature = float(
+        llm_config.get("temperature", 0.2)
+    )
+    timeout_seconds = float(
+        llm_config.get("timeout_seconds", 120)
+    )
+    keep_alive = llm_config.get(
+        "keep_alive",
+        "10m",
+    )
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": keep_alive,
+        "options": {
+            "num_predict": max_tokens,
+            "temperature": temperature,
+        },
+    }
+
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(
+            request,
+            timeout=timeout_seconds,
+        ) as response:
+            response_data = json.loads(
+                response.read().decode("utf-8")
+            )
+
+    except HTTPError as error:
+        try:
+            body = error.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+        except Exception:
+            body = ""
+
+        raise RuntimeError(
+            f"Ollama returned HTTP {error.code}: {body}"
+        ) from error
+
+    except URLError as error:
+        raise RuntimeError(
+            "Could not connect to Ollama at "
+            f"{base_url}. Make sure Ollama is running."
+        ) from error
+
+    except TimeoutError as error:
+        raise RuntimeError(
+            "Ollama did not respond before the timeout."
+        ) from error
+
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "Ollama returned invalid JSON."
+        ) from error
+
+    generated_text = str(
+        response_data.get("response", "")
+    ).strip()
+
+    if not generated_text:
+        raise RuntimeError(
+            "Ollama returned an empty explanation."
+        )
+
+    return generated_text
+
+
+def fallback_explanation(track: dict) -> str:
+    """
+    Produce a grounded explanation without an LLM.
+    """
+    nearest_tracks = track.get(
+        "nearest_seed_tracks",
+        [],
+    )
+
+    if nearest_tracks:
+        nearest_names = ", ".join(
+            item["title"]
+            for item in nearest_tracks[:2]
+        )
+
+        return (
+            f"This track ranked highly because it is close to "
+            f"the playlist's overall audio profile and is especially "
+            f"similar to seed tracks such as {nearest_names}."
+        )
+
+    return (
+        "This track ranked highly because its CLAP embedding is "
+        "similar to the combined audio profile of the seed playlist."
+    )
+
+def add_ollama_explanations(
+    result: dict,
+    config: dict,
+    max_tracks: int = 10,
+) -> None:
+    tracks = result.get("tracks", [])
+
+    explanation_count = min(
+        max(0, max_tracks),
+        len(tracks),
+    )
+
+    if explanation_count == 0:
+        return
+
+    print(
+        f"\nGenerating {explanation_count} "
+        "Ollama explanations..."
+    )
+
+    previous_explanations: list[str] = []
+
+    for number, track in enumerate(
+        tracks[:explanation_count],
+        start=1,
+    ):
+        nearest_tracks = track.get(
+            "nearest_seed_tracks",
+            [],
+        )
+
+        nearest_lines = "\n".join(
+            f"- {item['title']}: "
+            f"similarity={item['similarity']:.3f}"
+            for item in nearest_tracks
+        )
+
+        if not nearest_lines:
+            nearest_lines = (
+                "- No individual seed matches available"
+            )
+
+        angle = EXPLANATION_ANGLES[
+            (track["rank"] - 1)
+            % len(EXPLANATION_ANGLES)
+        ]
+
+        candidate_descriptor_text = (
+            format_audio_descriptors(
+                track.get("audio_descriptors", {})
+            )
+        )
+
+        playlist_descriptor_text = (
+            format_audio_descriptors(
+                result.get("playlist_descriptors", {})
+            )
+        )
+
+        previous_text = "\n".join(
+            f"- {explanation}"
+            for explanation in previous_explanations[-3:]
+        )
+
+        if not previous_text:
+            previous_text = "- None yet"
+
+        prompt = f"""
+You are explaining a recommendation made by an offline audio
+recommendation system.
+
+Write one or two natural sentences explaining why the candidate fits
+the user's playlist.
+
+Explanation angle:
+{angle}
+
+Candidate:
+{track["title"]}
+
+Candidate audio-analysis signals:
+{candidate_descriptor_text}
+
+Overall playlist audio-analysis signals:
+{playlist_descriptor_text}
+
+Overall playlist-profile similarity:
+{track["playlist_similarity"]:.3f}
+
+Average similarity to nearest seed tracks:
+{track["nearest_seed_similarity"]:.3f}
+
+Nearest seed tracks:
+{nearest_lines}
+
+Recent explanations already used:
+{previous_text}
+
+Rules:
+- Discuss genre, mood, tone, texture, similarity, or contrast when
+  supported by the supplied signals.
+- Treat descriptor labels as estimates, not certain facts.
+- Use wording such as "leans toward", "suggests", or "appears to share".
+- Do not invent artists, instruments, lyrics, release dates, or
+  historical facts.
+- Do not mention CLAP, FAISS, embeddings, scores, or algorithms.
+- Do not start with "This track was recommended because".
+- Avoid repeatedly saying "similar to the playlist".
+- Use noticeably different wording from the recent explanations.
+- Return only the explanation.
+""".strip()
+
+        print(
+            f"  Explaining {number}/{explanation_count}: "
+            f"{track['title']}"
+        )
+
+        try:
+            explanation = call_ollama(
+                prompt,
+                config,
+            )
+
+            track["explanation"] = explanation
+            track["explanation_source"] = "ollama"
+
+            previous_explanations.append(
+                explanation
+            )
+
+        except Exception as error:
+            print(
+                f"  Ollama explanation failed: {error}"
+            )
+
+            explanation = fallback_explanation(
+                track
+            )
+
+            track["explanation"] = explanation
+            track["explanation_source"] = "fallback"
+            track["explanation_error"] = str(error)
+
+            previous_explanations.append(
+                explanation
+            )
+
+def build_text_label_embeddings(
+    model,
+    labels: list[str],
+    prompt_template: str,
+) -> np.ndarray:
+    prompts = [
+        prompt_template.format(label=label)
+        for label in labels
+    ]
+
+    embeddings = model.get_text_embedding(
+        prompts,
+        use_tensor=False,
+    )
+
+    return normalize_rows(
+        np.asarray(embeddings, dtype=np.float32)
+    )
+
+
+def build_descriptor_banks(model) -> dict:
+    """
+    Create text embeddings once and reuse them for every recommendation.
+    """
+    return {
+        "genre": {
+            "labels": GENRE_LABELS,
+            "embeddings": build_text_label_embeddings(
+                model,
+                GENRE_LABELS,
+                "This audio is a {label} song.",
+            ),
+        },
+        "mood": {
+            "labels": MOOD_LABELS,
+            "embeddings": build_text_label_embeddings(
+                model,
+                MOOD_LABELS,
+                "This music has a {label} mood.",
+            ),
+        },
+        "tone": {
+            "labels": TONE_LABELS,
+            "embeddings": build_text_label_embeddings(
+                model,
+                TONE_LABELS,
+                "This music has a {label} tone and texture.",
+            ),
+        },
+    }
+
+
+def score_label_bank(
+    audio_embedding: np.ndarray,
+    labels: list[str],
+    text_embeddings: np.ndarray,
+    top_k: int = 3,
+) -> list[dict]:
+    audio_embedding = normalize_rows(
+        np.asarray(
+            audio_embedding,
+            dtype=np.float32,
+        ).reshape(1, -1)
+    )[0]
+
+    similarities = audio_embedding @ text_embeddings.T
+
+    top_indices = np.argsort(similarities)[::-1][:top_k]
+
+    return [
+        {
+            "label": labels[int(index)],
+            "score": float(similarities[int(index)]),
+        }
+        for index in top_indices
+    ]
+
+
+def describe_audio_embedding(
+    audio_embedding: np.ndarray,
+    descriptor_banks: dict,
+) -> dict:
+    result = {}
+
+    for category, bank in descriptor_banks.items():
+        result[category] = score_label_bank(
+            audio_embedding=audio_embedding,
+            labels=bank["labels"],
+            text_embeddings=bank["embeddings"],
+            top_k=3,
+        )
+
+    return result
 
 def recommend_from_directory(
     config_path: str,
@@ -222,7 +686,17 @@ def recommend_from_directory(
         recursive=recursive,
     )
 
-    seed_embeddings = embed_seed_tracks(seed_tracks)
+    (
+    seed_embeddings,
+    embedded_seed_tracks,
+    clap_model,
+    ) = embed_seed_tracks(seed_tracks)
+
+    print("Building genre, mood, and tone label embeddings...")
+
+    descriptor_banks = build_descriptor_banks(
+        clap_model
+    )
 
     print(
         f"\nSuccessfully embedded "
@@ -235,6 +709,11 @@ def recommend_from_directory(
         keepdims=True,
     )
     playlist_profile = normalize_rows(playlist_profile)
+
+    playlist_descriptors = describe_audio_embedding(
+      playlist_profile[0],
+      descriptor_banks,
+    )
 
     index = faiss.read_index(str(index_path))
 
@@ -327,6 +806,11 @@ def recommend_from_directory(
         axis=1,
     )[:, -nearest_count:].mean(axis=1)
 
+    nearest_seed_positions = np.argsort(
+    seed_similarity_matrix,
+    axis=1,
+    )[:, -nearest_count:][:, ::-1]
+
     # Hybrid score:
     # general playlist taste + strong local song similarities.
     final_scores = ( # Final song recommendation weightings
@@ -350,6 +834,33 @@ def recommend_from_directory(
 
         recommendation_path = mapping[catalog_id]
 
+        nearest_seed_tracks = []
+
+        for seed_position in nearest_seed_positions[position]:
+            seed_position = int(seed_position)
+
+            nearest_seed_tracks.append(
+                {
+                    "title": embedded_seed_tracks[
+                        seed_position
+                    ].stem,
+                    "path": str(
+                        embedded_seed_tracks[seed_position]
+                    ),
+                    "similarity": float(
+                        seed_similarity_matrix[
+                            position,
+                            seed_position,
+                        ]
+                    ),
+                }
+            )
+
+        audio_descriptors = describe_audio_embedding(
+            candidate_embeddings[position],
+            descriptor_banks,
+        )
+
         recommendations.append(
             {
                 "rank": rank,
@@ -362,6 +873,8 @@ def recommend_from_directory(
                 "nearest_seed_similarity": float(
                     nearest_seed_scores[position]
                 ),
+                "nearest_seed_tracks": nearest_seed_tracks,
+                "audio_descriptors": audio_descriptors,
             }
         )
 
@@ -377,11 +890,32 @@ def recommend_from_directory(
             for path in seed_tracks
         ],
         "seed_track_count": len(seed_tracks),
-        "embedded_seed_count": len(seed_embeddings),
+        "embedded_seed_count": len(embedded_seed_tracks),
+        "playlist_descriptors": playlist_descriptors,
         "recommendation_count": len(recommendations),
         "tracks": recommendations,
     }
 
+def format_descriptor_list(
+    descriptors: list[dict],
+) -> str:
+    return ", ".join(
+        f"{item['label']} ({item['score']:.3f})"
+        for item in descriptors
+    )
+
+
+def format_audio_descriptors(
+    descriptors: dict,
+) -> str:
+    return (
+        "Possible genre/style signals: "
+        f"{format_descriptor_list(descriptors.get('genre', []))}\n"
+        "Possible mood signals: "
+        f"{format_descriptor_list(descriptors.get('mood', []))}\n"
+        "Possible tone/texture signals: "
+        f"{format_descriptor_list(descriptors.get('tone', []))}"
+    )
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -425,6 +959,22 @@ def main() -> None:
         default="data/directory_recommendations.json",
     )
 
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="Generate recommendation explanations with Ollama.",
+    )
+
+    parser.add_argument(
+        "--explain-limit",
+        type=int,
+        default=10,
+        help=(
+            "Maximum number of recommendations to explain. "
+            "Defaults to 10."
+        ),
+    )
+
     args = parser.parse_args()
 
     result = recommend_from_directory(
@@ -435,6 +985,19 @@ def main() -> None:
         recursive=args.recursive,
     )
 
+    config = load_config(args.config)
+
+    llm_enabled = bool(
+        config.get("llm", {}).get("enabled", False)
+    )
+
+    if args.explain or llm_enabled:
+        add_ollama_explanations(
+            result=result,
+            config=config,
+            max_tracks=max(0, args.explain_limit),
+        )
+
     print("\nRecommendations:\n")
 
     for track in result["tracks"]:
@@ -444,6 +1007,11 @@ def main() -> None:
             f"(score={track['score']:.3f})"
         )
         print(f"     {track['path']}")
+
+        if track.get("explanation"):
+          print(
+              f"     Why: {track['explanation']}"
+          )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(
