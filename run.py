@@ -1,4 +1,5 @@
-"""Bootstrap wrapper that installs missing dependencies on the fly and delegates to main.py.
+"""
+Bootstrap wrapper that installs missing dependencies on the fly and delegates to main.py.
 
 This script is designed for users who do not want to manage virtual environments
 or install packages manually.  It will check for required Python modules,
@@ -36,7 +37,6 @@ REQUIRED_MODULES = {
     "rich": "rich",
     # Note: PyTorch installation may need a specific CUDA wheel; fallback to CPU.
 }
-
 """
 
 
