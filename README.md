@@ -6,7 +6,12 @@ The Presentation related to this github repo can be found here: {link}
 
 # Running the tool:
 
-To run the tool first run 
+To run the tool:
+```
+python pip install requirements.txt
+cp config.yaml.example config.yaml
+```
+Then edit the /Path/To/Your/Music_dir to your **Catalog of songs to recommend from**
 ```
 python main.py ingest
 ```
