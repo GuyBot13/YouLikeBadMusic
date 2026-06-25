@@ -12,6 +12,6 @@ python main.py ingest
 ```
 Then run
 ```
-python -m scripts.recommend_from_playlist --seed-dir "/Path/Too/Your/Playlist" --limit {number of songs to recommend}
+python -m scripts.recommend_from_playlist   --seed-dir "/Path/To/Playlist/You/Want/A/Recommendation/From"   --limit [number of songs to recommend]   --explain   --explain-limit [number of expainations to give
 ```
 
